@@ -43,6 +43,7 @@ def extract_shamsi_year(date_str):
 
 
 def calculate_real_price(data, price_col, year_col):
+ 
     inflation_rates = {
         1400: 0.40,
         1401: 0.46,
@@ -50,17 +51,17 @@ def calculate_real_price(data, price_col, year_col):
         1403: 0.325
     }
 
-    cpi = {1400: 100}
+    cpi = {1399: 100}
+    cpi[1400] = cpi[1399] * (1 + inflation_rates[1400])
     cpi[1401] = cpi[1400] * (1 + inflation_rates[1401])
     cpi[1402] = cpi[1401] * (1 + inflation_rates[1402])
     cpi[1403] = cpi[1402] * (1 + inflation_rates[1403])
 
-    # ضریب تعدیل نسبت به سال پایه
+    # ضریب تعدیل نسبت به سال پایه ۱۳۹۹
     adjustment_factor = {year: cpi[year] / 100 for year in cpi}
 
     df = data.copy()
 
-    # فقط آگهی‌های فروش
     if "cat2_slug" in df.columns:
         df = df[df["cat2_slug"].isin(["residential-sell", "commercial-sell"])]
 
