@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import geopandas as gpd
 import jdatetime
+import re
 
 from datetime import datetime
 from shapely.geometry import Point
@@ -41,46 +42,48 @@ def extract_shamsi_year(date_str):
 
 
 
-def calculate_real_price(data, price_value_col, shamsi_year_col):
-    
-    # فقط سال‌های ۱۴۰۰ تا ۱۴۰۳ رو نگه می‌داریم
-    df_filtered = data[data[shamsi_year_col].isin([1400, 1401, 1402, 1403])].copy()
-    df_filtered = df_filtered[df_filtered[price_value_col].notna()]
-    
-    # میانگین قیمت اسمی
-    nominal_mean = df_filtered.groupby(shamsi_year_col)[price_value_col].mean()
-    
-    # نرخ تورم تقریبی (مرکز آمار)
+def calculate_real_price(data, price_col, year_col):
     inflation_rates = {
         1400: 0.40,
         1401: 0.46,
         1402: 0.41,
-        1403: 0.325   
+        1403: 0.325
     }
-    
-    # محاسبه ضریب تجمعی تورم (CPI نسبی)
-    cpi = {1400: 100}  # سال پایه
 
+    cpi = {1400: 100}
     cpi[1401] = cpi[1400] * (1 + inflation_rates[1401])
     cpi[1402] = cpi[1401] * (1 + inflation_rates[1402])
     cpi[1403] = cpi[1402] * (1 + inflation_rates[1403])
-    
-    # ساخت دیکشنری ضریب تعدیل (نسبت به سال پایه)
+
+    # ضریب تعدیل نسبت به سال پایه
     adjustment_factor = {year: cpi[year] / 100 for year in cpi}
 
-    # محاسبه میانگین قیمت حقیقی
+    df = data.copy()
+
+    # فقط آگهی‌های فروش
+    if "cat2_slug" in df.columns:
+        df = df[df["cat2_slug"].isin(["residential-sell", "commercial-sell"])]
+
+    df = df[df[year_col].isin([1400, 1401, 1402, 1403])]
+    df = df[df[price_col].notna() & (df[price_col] > 0)]
+
+    # میانگین قیمت اسمی
+    nominal_mean = df.groupby(year_col)[price_col].mean()
+
+    # میانگین قیمت حقیقی
     real_mean = {}
     for year in [1400, 1401, 1402, 1403]:
         if year in nominal_mean.index:
             real_mean[year] = nominal_mean[year] / adjustment_factor[year]
+
     real_mean = pd.Series(real_mean)
-    
+
     comparison = pd.DataFrame({
-    'nominal_mean': nominal_mean,
-    'real_mean': real_mean
+        "nominal_mean": nominal_mean,
+        "real_mean": real_mean
     })
-    
-    return comparison
+
+    return comparison.round(2)
 
 
 
@@ -88,38 +91,30 @@ def calculate_real_price(data, price_value_col, shamsi_year_col):
 def prepare_amenities_gdf(
     data, amenities, iran_map, residential_cat):
     
-    # ۱. فیلتر املاک مسکونی
     df_res = data[data['cat2_slug'].isin(residential_cat)].copy()
     
-    # ۲. چک ستون‌ها
     existing = [col for col in amenities if col in df_res.columns]
     
-    # ۳. تبدیل امکانات به 0/1
     for col in existing:
         df_res[col] = df_res[col].astype(str).str.lower().str.strip().map({'true': 1, 'false': 0})
     
-    # ۴. حذف NaN مختصات
     df_res = df_res.dropna(subset=['location_latitude', 'location_longitude'])
     
-    # ۵. فیلتر Bounding Box
     lat_min, lat_max = 24.5, 40.5
     lon_min, lon_max = 43.5, 64.0
     
     mask_bbox = (df_res['location_latitude'].between(lat_min, lat_max) & df_res['location_longitude'].between(lon_min, lon_max))
     df_res = df_res[mask_bbox].copy()
     
-    # ۶. ساخت GeoDataFrame
     props_gdf = gpd.GeoDataFrame(df_res[['city_slug'] + existing], 
                                  geometry=gpd.points_from_xy(df_res['location_longitude'], df_res['location_latitude']),
                                  crs='EPSG:4326')
     
-    # ۷. آماده‌سازی نقشه با Buffer ۵ کیلومتری
     if iran_map.crs != props_gdf.crs:
         iran_same_crs = iran_map.to_crs(props_gdf.crs)
     else:
         iran_same_crs = iran_map
     
-    # ۸. Spatial Join
     props_gdf = gpd.sjoin(
         props_gdf,
         iran_same_crs[['name', 'geometry']],
@@ -129,7 +124,6 @@ def prepare_amenities_gdf(
     
     props_gdf = props_gdf.drop(columns=['index_right'], errors='ignore')
     
-    # ۹. حذف نقاط باقی‌مانده خارج از مرز
     props_gdf = props_gdf.dropna(subset=['province']).copy()
     
     return props_gdf
@@ -146,7 +140,6 @@ def plot_amenities_scatter(
     group_title='',
     sample_size=20000,
     ncols=2,
-    figsize_per_plot=(7, 7),
 ):
     n = len(amenities)
     
@@ -160,17 +153,15 @@ def plot_amenities_scatter(
     
     fig, axes = plt.subplots(
         nrows, ncols,
-        figsize=(figsize_per_plot[0] * ncols, figsize_per_plot[1] * nrows)
+        figsize=(7 * ncols, 7 * nrows)
     )
     axes = axes.flatten() if n > 1 else [axes]
     
     for i, (amenity, title, color) in enumerate(zip(amenities, titles, colors)):
         ax = axes[i]
         
-        # نقشه زمینه
         iran_map.plot(ax=ax, color='#f5f5f5', edgecolor='#888888', linewidth=0.5)
         
-        # نقاط دارای امکانات
         has_amenity = props_gdf[props_gdf[amenity] == 1]
         n_with = len(has_amenity)
         
@@ -185,7 +176,6 @@ def plot_amenities_scatter(
         )
         ax.axis('off')
     
-    # خاموش کردن پلات‌های خالی
     for j in range(n, len(axes)):
         axes[j].axis('off')
     
@@ -209,7 +199,6 @@ def plot_amenities_choropleth(
     n = len(amenities)
     
     titles = amenities
-    # High-contrast colormaps
     cmaps = ['YlOrRd', 'YlGnBu', 'Greens', 'Oranges', 'Purples', 'Reds'][:n]
     
     nrows = (n + ncols - 1) // ncols
@@ -223,14 +212,12 @@ def plot_amenities_choropleth(
     for i, (amenity, title, cmap) in enumerate(zip(amenities, titles, cmaps)):
         ax = axes[i]
         
-        # Province-level stats
         stats = props_gdf.groupby('province').agg(
             ratio=(amenity, 'mean'),
             total=('city_slug', 'size')
         ).reset_index()
         stats = stats[stats['total'] >= min_listings]
         
-        # Merge with map
         iran_stats = iran_map.merge(
             stats, left_on='name', right_on='province', how='left'
         )
@@ -240,20 +227,16 @@ def plot_amenities_choropleth(
                 iran_stats, geometry='geometry', crs=iran_map.crs
             )
         
-        # Background (provinces without data)
         bg = iran_stats[iran_stats['ratio'].isna()]
         if not bg.empty:
             bg.plot(ax=ax, color='#f0f0f0',
                     edgecolor='#cccccc', linewidth=0.5)
         
-        # Colored map (provinces with data)
         colored = iran_stats.dropna(subset=['ratio'])
         if not colored.empty:
-            # ✅ Dynamic range for higher contrast
             vmin_data = colored['ratio'].min()
             vmax_data = colored['ratio'].max()
             
-            # Add small padding to avoid zero range
             if vmax_data - vmin_data < 0.01:
                 vmin_data = max(0, vmin_data - 0.01)
                 vmax_data = min(1, vmax_data + 0.01)
@@ -283,186 +266,234 @@ def plot_amenities_choropleth(
 
 
 
+def test_business_deed_effect(data, deed_col="has_business_deed", price_col="price_value"):
+    df = data.copy()
 
-import pandas as pd
-import numpy as np
-from scipy import stats
-
-
-def test_business_deed_effect(
-    data,
-    commercial_cat='commercial-sell',
-    target_col='price_value',
-    group_col='has_business_deed',
-):
-    """
-    بررسی تأثیر سند تجاری بر قیمت فروش ملک تجاری.
-    
-    Returns: dict
-        شامل میانگین‌ها، p-value، آزمون استفاده‌شده، اندازه اثر
-    """
-    # ۱. فیلتر املاک تجاری فروش
-    df = data[data['cat2_slug'] == commercial_cat].copy()
-    
-    # ۲. تبدیل گروه به ۰/۱
-    df[group_col] = (
-        df[group_col]
-        .astype(str).str.lower().str.strip()
-        .map({'true': 1, 'false': 0})
+    # نرمال‌سازی سند
+    df[deed_col] = (
+        df[deed_col]
+        .replace({"true": True, "false": False, "unselect": pd.NA})
+        .astype("boolean")
     )
-    
-    # ۳. حذف NaN
-    df = df.dropna(subset=[group_col, target_col])
-    df[group_col] = df[group_col].astype(int)
-    
-    # ۴. جدا کردن دو گروه
-    group_with = df[df[group_col] == 1][target_col]
-    group_without = df[df[group_col] == 0][target_col]
-    
-    # ۵. آمار توصیفی
-    desc = {
-        'with_deed': {
-            'count': len(group_with),
-            'mean': group_with.mean(),
-            'median': group_with.median(),
-            'std': group_with.std(),
-        },
-        'without_deed': {
-            'count': len(group_without),
-            'mean': group_without.mean(),
-            'median': group_without.median(),
-            'std': group_without.std(),
-        },
-    }
-    
-    # ۶. آزمون نرمال بودن (روی نمونه)
-    sample_with = group_with.sample(min(5000, len(group_with)), random_state=42)
-    sample_without = group_without.sample(min(5000, len(group_without)), random_state=42)
-    _, p_norm_with = stats.shapiro(sample_with)
-    _, p_norm_without = stats.shapiro(sample_without)
-    is_normal = (p_norm_with >= 0.05) and (p_norm_without >= 0.05)
-    
-    # ۷. آزمون فرض
-    if is_normal:
-        stat, p_value = stats.ttest_ind(group_with, group_without, equal_var=False)
-        test_used = 'Welch t-test'
-    else:
-        stat, p_value = stats.mannwhitneyu(
-            group_with, group_without, alternative='two-sided'
-        )
-        test_used = 'Mann-Whitney U'
-    
-    # ۸. اندازه اثر (Cohen's d)
-    nx, ny = len(group_with), len(group_without)
-    pooled_std = np.sqrt(
-        ((nx - 1) * group_with.std()**2 + (ny - 1) * group_without.std()**2)
-        / (nx + ny - 2)
-    )
-    cohens_d = ((group_with.mean() - group_without.mean()) / pooled_std if pooled_std > 0 else 0)
-    
-    # ۹. تفسیر اندازه اثر
+
+    df = df.dropna(subset=[deed_col, price_col])
+    df = df[df[price_col] > 0]
+
+    # حذف پرت‌ها
+    q1 = df[price_col].quantile(0.25)
+    q3 = df[price_col].quantile(0.75)
+    iqr = q3 - q1
+    df = df[(df[price_col] >= q1 - 1.5 * iqr) &
+            (df[price_col] <= q3 + 1.5 * iqr)]
+
+    with_deed = df[df[deed_col] == True][price_col]
+    without_deed = df[df[deed_col] == False][price_col]
+
+    if len(with_deed) < 30 or len(without_deed) < 30:
+        print("داده کافی برای مقایسه وجود ندارد.")
+        return None
+
+    # آزمون آماری
+    _, p_value = stats.mannwhitneyu(with_deed, without_deed, alternative="two-sided")
+
+    # اندازه اثر
+    pooled_std = np.sqrt((with_deed.std()**2 + without_deed.std()**2) / 2)
+    cohens_d = (with_deed.mean() - without_deed.mean()) / pooled_std if pooled_std > 0 else 0
+
     abs_d = abs(cohens_d)
     if abs_d < 0.2:
-        effect_label = 'negligible'
+        effect = "negligible"
     elif abs_d < 0.5:
-        effect_label = 'small'
+        effect = "small"
     elif abs_d < 0.8:
-        effect_label = 'medium'
+        effect = "medium"
     else:
-        effect_label = 'large'
-    
-    # ۱۰. نتیجه‌گیری
-    is_significant = p_value < 0.05
-    
+        effect = "large"
+
+    result = pd.DataFrame([{
+        "group": "با سند",
+        "count": len(with_deed),
+        "mean": round(with_deed.mean()),
+        "median": round(with_deed.median())
+    }, {
+        "group": "بدون سند",
+        "count": len(without_deed),
+        "mean": round(without_deed.mean()),
+        "median": round(without_deed.median())
+    }])
+
+    print("=== نتیجه آزمون سند تجاری ===")
+    print(result.to_string(index=False))
+    print(f"\np-value          : {p_value:.6e}")
+    print(f"significant      : {p_value < 0.05}")
+    print(f"Cohen's d        : {cohens_d:.4f}")
+    print(f"effect size      : {effect}")
+
     return {
-        'descriptive': desc,
-        'normality': {
-            'p_value_with': p_norm_with,
-            'p_value_without': p_norm_without,
-            'is_normal': is_normal,
-        },
-        'test': {
-            'name': test_used,
-            'statistic': stat,
-            'p_value': p_value,
-        },
-        'effect_size': {
-            'cohens_d': cohens_d,
-            'label': effect_label,
-        },
-        'conclusion': {
-            'alpha': 0.05,
-            'is_significant': is_significant,
-            'message': (
-                'Business deed has a significant effect on price.'
-                if is_significant else
-                'No significant effect observed.'
-            ),
-        },
+        "result_table": result,
+        "p_value": p_value,
+        "significant": p_value < 0.05,
+        "cohens_d": round(cohens_d, 4),
+        "effect_size": effect,
+        "with_deed": with_deed,
+        "without_deed": without_deed
     }
 
 
 
 
-def test_amenity_effect_on_price(
-    data,
-    amenities,
-    category='residential-sell',
-    target_col='price_value',
-):
-    """
-    آزمون تأثیر هر امکانات بر قیمت فروش.
-        
-    Returns
-    -------
-    pd.DataFrame
-        نتایج آزمون برای هر امکانات
-    """
-    df = data[data['cat2_slug'] == category].copy()
+
+def test_amenity_effect_on_price(data, amenities, price_col='price_value'):
+    if isinstance(amenities, str):
+        amenities = [amenities]
+
     results = []
-    
+
     for amenity in amenities:
-        if amenity not in df.columns:
+        df = data.copy()
+
+        df[amenity] = (df[amenity].replace({"true": True, "false": False, "unselect": pd.NA}).astype("boolean")
+)
+
+        df = df.dropna(subset=[amenity, price_col])
+        df = df[df[price_col] > 0]
+
+        # حذف پرت‌ها
+        q1 = df[price_col].quantile(0.25)
+        q3 = df[price_col].quantile(0.75)
+        iqr = q3 - q1
+        df = df[(df[price_col] >= q1 - 1.5 * iqr) & 
+                (df[price_col] <= q3 + 1.5 * iqr)]
+
+        has = df[df[amenity] == True][price_col]
+        not_has = df[df[amenity] == False][price_col]
+
+        if len(has) < 30 or len(not_has) < 30:
             continue
-        
-        # تبدیل به ۰/۱/NaN
-        col = (
-            df[amenity]
-            .astype(str).str.lower().str.strip()
-            .map({'true': 1, 'false': 0})
-        )
-        
-        temp = df[[target_col]].copy()
-        temp['group'] = col
-        temp = temp.dropna(subset=['group', target_col])
-        temp['group'] = temp['group'].astype(int)
-        
-        g1 = temp[temp['group'] == 1][target_col]
-        g0 = temp[temp['group'] == 0][target_col]
-        
-        if len(g1) < 5 or len(g0) < 5:
-            continue
-        
-        # آزمون Mann-Whitney U
-        stat, p = stats.mannwhitneyu(g1, g0, alternative='two-sided')
-        
-        # اندازه اثر Cohen's d
-        nx, ny = len(g1), len(g0)
-        pooled_std = np.sqrt(((nx - 1) * g1.std()**2 + (ny - 1) * g0.std()**2) / (nx + ny - 2))
-        d = (g1.mean() - g0.mean()) / pooled_std if pooled_std > 0 else 0
-        
-        abs_d = abs(d)
+
+        # آزمون
+        _, p_value = stats.mannwhitneyu(has, not_has, alternative="two-sided")
+
+        # اندازه اثر
+        pooled_std = np.sqrt((has.std()**2 + not_has.std()**2) / 2)
+        cohens_d = (has.mean() - not_has.mean()) / pooled_std if pooled_std > 0 else 0
+
+        # تفسیر اندازه اثر
+        abs_d = abs(cohens_d)
         if abs_d < 0.2:
-            effect = 'negligible'
+            effect = "negligible"
         elif abs_d < 0.5:
-            effect = 'small'
+            effect = "small"
         elif abs_d < 0.8:
-            effect = 'medium'
+            effect = "medium"
         else:
-            effect = 'large'
-        
-        results.append({'amenity': amenity, 'n_with': len(g1), 'n_without': len(g0), 'mean_with': g1.mean(), 
-                        'mean_without': g0.mean(), 'median_with': g1.median(), 'median_without': g0.median(), 
-                        'p_value': p, 'significant': p < 0.05, 'cohens_d': d, 'effect_size': effect,})
+            effect = "large"
+
+        results.append({
+            "amenity": amenity,
+            "n_with": len(has),
+            "n_without": len(not_has),
+            "mean_with": round(has.mean()),
+            "mean_without": round(not_has.mean()),
+            "median_with": round(has.median()),
+            "median_without": round(not_has.median()),
+            "p_value": p_value,
+            "significant": p_value < 0.05,
+            "cohens_d": round(cohens_d, 4),
+            "effect_size": effect
+        })
+
+    return pd.DataFrame(results)
+
+
+def persian_to_latin(text):
+    """تبدیل اعداد و کاراکترهای فارسی به لاتین"""
+    if pd.isna(text):
+        return text
+    text = str(text)
+    persian_digits = '۰۱۲۳۴۵۶۷۸۹'
+    arabic_digits = '٠١٢٣٤٥٦٧٨٩'
+    latin_digits = '0123456789'
     
-    return pd.DataFrame(results).sort_values('p_value')
+    trans_table = str.maketrans(
+        persian_digits + arabic_digits,
+        latin_digits + latin_digits
+    )
+    return text.translate(trans_table)
+
+
+
+def extract_year(val):
+    """استخراج سال ساخت به صورت عددی"""
+    if pd.isna(val):
+        return np.nan
+    val = str(val).strip()
+    
+    if 'قبل از' in val or 'قبل' in val:
+        return 1369  
+    
+    match = re.search(r'1[34]\d{2}', val)
+    if match:
+        year = int(match.group())
+
+        return year
+
+
+
+
+def normalize_bool(val):
+    if pd.isna(val):
+        return np.nan
+    val = str(val).strip().lower()
+    if val in ['true', '1', 'yes', 'بله', 'دارد']:
+        return True
+    if val in ['false', '0', 'no', 'خیر', 'ندارد']:
+        return False
+    if val in ['unselect', '', 'nan', 'none']:
+        return np.nan
+    return np.nan
+
+
+
+
+
+def to_jalali(date):
+    """تبدیل تاریخ میلادی به شمسی"""
+    if pd.isna(date):
+        return np.nan
+    try:
+        g = pd.to_datetime(date)
+        j = jdatetime.date.fromgregorian(date=g)
+        return j
+    except:
+        return np.nan
+
+
+
+
+def parse_number(val):
+    if pd.isna(val):
+        return np.nan
+    val = str(val).strip()
+    # حذف کاما و فاصله
+    val = val.replace(',', '').replace('،', '').strip()
+    try:
+        return float(val)
+    except:
+        # اگر داخل متن عدد بود، استخراج کن
+        match = re.search(r'\d+(\.\d+)?', val)
+        if match:
+            return float(match.group())
+        return np.nan
+
+
+
+
+def normalize_text(text):
+    if pd.isna(text):
+        return ""
+    text = str(text)
+    text = text.replace('ي', 'ی').replace('ك', 'ک') 
+    text = re.sub(r'\u200c', ' ', text)                 
+    text = re.sub(r'\s+', ' ', text)                   
+    return text.strip()
